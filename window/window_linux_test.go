@@ -3,7 +3,10 @@
 package window
 
 import (
+	"github.com/neurlang/wayland/wl"
+
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -189,5 +192,108 @@ func TestDrainPendingResizesAppliesRequestFromResizeHandler(t *testing.T) {
 	}
 	if window.resizeNeeded != 0 {
 		t.Errorf("resizeNeeded = %d, want 0", window.resizeNeeded)
+// TestWindowScheduleRedrawTaskConcurrent verifies that concurrent redraw
+// requests atomically claim a single deferred task. In particular, the
+// scheduled flag must already be visible when the task is published to the
+// display queue; otherwise DisplayRun can consume the task before the flag is
+// set and all later redraw requests will be dropped.
+func TestWindowScheduleRedrawTaskConcurrent(t *testing.T) {
+	const (
+		attempts = 100
+		workers  = 32
+	)
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		d := &Display{}
+		w := &Window{Display: d}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				windowScheduleRedrawTask(w)
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		d.deferredMu.Lock()
+		queued := len(d.deferredListNew)
+		d.deferredMu.Unlock()
+
+		if queued != 1 {
+			t.Fatalf("attempt %d: queued redraw tasks = %d, want 1", attempt, queued)
+		}
+		if got := atomic.LoadInt32(&w.redrawTaskScheduled); got != 1 {
+			t.Fatalf("attempt %d: redrawTaskScheduled = %d, want 1", attempt, got)
+		}
+func TestWindowGeometryIncludesClientTitlebar(t *testing.T) {
+	window := &Window{
+		mainSurface: &surface{allocation: Rectangle{X: 3, Y: 5, Width: 1707, Height: 1021}},
+		decoration:  &WindowDecoration{},
+	}
+
+	var geometry Rectangle
+	windowGetGeometry(window, &geometry)
+
+	want := Rectangle{X: 3, Y: 5 - TitleHeight, Width: 1707, Height: 1021 + TitleHeight}
+	if geometry != want {
+		t.Fatalf("window geometry = %+v, want %+v", geometry, want)
+	}
+}
+
+func TestWindowGeometryExcludesNoUndecoratedSpace(t *testing.T) {
+	window := &Window{
+		mainSurface: &surface{allocation: Rectangle{X: 3, Y: 5, Width: 1707, Height: 1021}},
+	}
+
+	var geometry Rectangle
+	windowGetGeometry(window, &geometry)
+
+	want := Rectangle{X: 3, Y: 5, Width: 1707, Height: 1021}
+	if geometry != want {
+		t.Fatalf("window geometry = %+v, want %+v", geometry, want)
+	}
+}
+
+func TestWindowContentHeightForGeometry(t *testing.T) {
+	decorated := &Window{
+		Display:              &Display{subcompositor: &wl.Subcompositor{}},
+		decorationsRequested: true,
+	}
+
+	height, ok := windowContentHeightForGeometry(decorated, 1021)
+	if !ok || height != 1021-TitleHeight {
+		t.Fatalf("decorated content height = %d, %t; want %d, true", height, ok, 1021-TitleHeight)
+	}
+
+	decorated.decoration = &WindowDecoration{}
+	decorated.decorationsRequested = false
+	height, ok = windowContentHeightForGeometry(decorated, 1021)
+	if !ok || height != 1021-TitleHeight {
+		t.Fatalf("created decoration content height = %d, %t; want %d, true", height, ok, 1021-TitleHeight)
+	}
+
+	decorated.fullscreen = true
+	height, ok = windowContentHeightForGeometry(decorated, 1021)
+	if !ok || height != 1021 {
+		t.Fatalf("fullscreen content height = %d, %t; want 1021, true", height, ok)
+	}
+
+	undecorated := &Window{Display: &Display{subcompositor: &wl.Subcompositor{}}}
+	height, ok = windowContentHeightForGeometry(undecorated, 1021)
+	if !ok || height != 1021 {
+		t.Fatalf("undecorated content height = %d, %t; want 1021, true", height, ok)
+	}
+
+	_, ok = windowContentHeightForGeometry(&Window{
+		Display:              &Display{subcompositor: &wl.Subcompositor{}},
+		decorationsRequested: true,
+	}, TitleHeight)
+	if ok {
+		t.Fatal("titlebar-only geometry was accepted")
 	}
 }

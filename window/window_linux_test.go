@@ -6,6 +6,7 @@ import (
 	"github.com/neurlang/wayland/wl"
 
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -105,6 +106,44 @@ func TestDisplayRunWakesOnDefer(t *testing.T) {
 	}
 }
 
+// TestWindowScheduleRedrawTaskConcurrent verifies that concurrent redraw
+// requests atomically claim a single deferred task. In particular, the
+// scheduled flag must already be visible when the task is published to the
+// display queue; otherwise DisplayRun can consume the task before the flag is
+// set and all later redraw requests will be dropped.
+func TestWindowScheduleRedrawTaskConcurrent(t *testing.T) {
+	const (
+		attempts = 100
+		workers  = 32
+	)
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		d := &Display{}
+		w := &Window{Display: d}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				windowScheduleRedrawTask(w)
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		d.deferredMu.Lock()
+		queued := len(d.deferredListNew)
+		d.deferredMu.Unlock()
+
+		if queued != 1 {
+			t.Fatalf("attempt %d: queued redraw tasks = %d, want 1", attempt, queued)
+		}
+		if got := atomic.LoadInt32(&w.redrawTaskScheduled); got != 1 {
+			t.Fatalf("attempt %d: redrawTaskScheduled = %d, want 1", attempt, got)
+		}
 func TestWindowGeometryIncludesClientTitlebar(t *testing.T) {
 	window := &Window{
 		mainSurface: &surface{allocation: Rectangle{X: 3, Y: 5, Width: 1707, Height: 1021}},
